@@ -12,6 +12,7 @@ import traceback
 
 from gunicorn import util
 from gunicorn.workers.workertmp import WorkerTmp
+from gunicorn.reloader import Reloader
 from gunicorn.http.errors import InvalidHeader, InvalidHeaderName, \
 InvalidRequestLine, InvalidRequestMethod, InvalidHTTPVersion, \
 LimitRequestLine, LimitRequestHeaders
@@ -45,7 +46,6 @@ class Worker(object):
         self.max_requests = cfg.max_requests or MAXSIZE
         self.alive = True
         self.log = log
-        self.debug = cfg.debug
         self.tmp = WorkerTmp(cfg)
 
     def __str__(self):
@@ -78,6 +78,20 @@ class Worker(object):
         super(MyWorkerClass, self).init_process() so that the ``run()``
         loop is initiated.
         """
+
+        # start the reloader
+        if self.cfg.reload:
+            def changed(fname):
+                self.log.info("Worker reloading: %s modified", fname)
+                os.kill(self.pid, signal.SIGTERM)
+                raise SystemExit()
+            Reloader(callback=changed).start()
+
+        # set environment' variables
+        if self.cfg.env:
+            for k, v in self.cfg.env.items():
+                os.environ[k] = v
+
         util.set_owner_process(self.cfg.uid, self.cfg.gid)
 
         # Reseed the random number generator
@@ -89,7 +103,7 @@ class Worker(object):
             util.set_non_blocking(p)
             util.close_on_exec(p)
 
-        # Prevent fd inherientence
+        # Prevent fd inheritance
         [util.close_on_exec(s) for s in self.sockets]
         util.close_on_exec(self.tmp.fileno())
 
@@ -98,6 +112,8 @@ class Worker(object):
         self.init_signals()
 
         self.wsgi = self.app.wsgi()
+
+        self.cfg.post_worker_init(self)
 
         # Enter main run loop
         self.booted = True
@@ -126,6 +142,8 @@ class Worker(object):
 
     def handle_exit(self, sig, frame):
         self.alive = False
+        # worker_int callback
+        self.cfg.worker_int(self)
         sys.exit(0)
 
     def handle_error(self, req, client, addr, exc):
@@ -140,24 +158,24 @@ class Worker(object):
             reason = "Bad Request"
 
             if isinstance(exc, InvalidRequestLine):
-                mesg = "<p>Invalid Request Line '%s'</p>" % str(exc)
+                mesg = "Invalid Request Line '%s'" % str(exc)
             elif isinstance(exc, InvalidRequestMethod):
-                mesg = "<p>Invalid Method '%s'</p>" % str(exc)
+                mesg = "Invalid Method '%s'" % str(exc)
             elif isinstance(exc, InvalidHTTPVersion):
-                mesg = "<p>Invalid HTTP Version '%s'</p>" % str(exc)
+                mesg = "Invalid HTTP Version '%s'" % str(exc)
             elif isinstance(exc, (InvalidHeaderName, InvalidHeader,)):
-                mesg = "<p>%s</p>" % str(exc)
+                mesg = "%s" % str(exc)
                 if not req and hasattr(exc, "req"):
                     req = exc.req  # for access log
             elif isinstance(exc, LimitRequestLine):
-                mesg = "<p>%s</p>" % str(exc)
+                mesg = "%s" % str(exc)
             elif isinstance(exc, LimitRequestHeaders):
-                mesg = "<p>Error parsing headers: '%s'</p>" % str(exc)
+                mesg = "Error parsing headers: '%s'" % str(exc)
             elif isinstance(exc, InvalidProxyLine):
-                mesg = "<p>'%s'</p>" % str(exc)
+                mesg = "'%s'" % str(exc)
             elif isinstance(exc, ForbiddenProxyRequest):
                 reason = "Forbidden"
-                mesg = "<p>Request forbidden</p>"
+                mesg = "Request forbidden"
                 status_int = 403
 
             self.log.debug("Invalid request from ip={ip}: {error}"\
@@ -181,10 +199,6 @@ class Worker(object):
             resp.status = "%s %s" % (status_int, reason)
             resp.response_length = len(mesg)
             self.log.access(resp, req, environ, request_time)
-
-        if self.debug:
-            tb = traceback.format_exc()
-            mesg += "<h2>Traceback:</h2>\n<pre>%s</pre>" % tb
 
         try:
             util.write_error(client, status_int, reason, mesg)

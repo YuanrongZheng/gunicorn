@@ -4,7 +4,9 @@
 # See the NOTICE for more information.
 
 
+import email.utils
 import fcntl
+import io
 import os
 import pkg_resources
 import random
@@ -17,9 +19,12 @@ import traceback
 import inspect
 import errno
 import warnings
+import cgi
 
 from gunicorn.errors import AppImportError
-from gunicorn.six import text_type, string_types
+from gunicorn.six import text_type
+from gunicorn.workers import SUPPORTED_WORKERS
+
 
 MAXFD = 1024
 REDIRECT_TO = getattr(os, 'devnull', '/dev/null')
@@ -29,11 +34,6 @@ timeout_default = object()
 CHUNK_SIZE = (16 * 1024)
 
 MAX_BODY = 1024 * 132
-
-weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-monthname = [None,
-             'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-             'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 # Server and Date aren't technically hop-by-hop
 # headers, but they are in the purview of the
@@ -95,7 +95,8 @@ relative import to an absolute import.
         return sys.modules[name]
 
 
-def load_class(uri, default="sync", section="gunicorn.workers"):
+def load_class(uri, default="gunicorn.workers.sync.SyncWorker",
+        section="gunicorn.workers"):
     if inspect.isclass(uri):
         return uri
     if uri.startswith("egg:"):
@@ -116,27 +117,31 @@ def load_class(uri, default="sync", section="gunicorn.workers"):
     else:
         components = uri.split('.')
         if len(components) == 1:
-            try:
+            while True:
                 if uri.startswith("#"):
                     uri = uri[1:]
 
-                return pkg_resources.load_entry_point("gunicorn",
-                            section, uri)
-            except:
-                exc = traceback.format_exc()
-                raise RuntimeError("class uri %r invalid or not found: \n\n[%s]" % (uri,
-                    exc))
+                if uri in SUPPORTED_WORKERS:
+                    components = SUPPORTED_WORKERS[uri].split(".")
+                    break
+
+                try:
+                    return pkg_resources.load_entry_point("gunicorn",
+                                section, uri)
+                except:
+                    exc = traceback.format_exc()
+                    raise RuntimeError("class uri %r invalid or not found: \n\n[%s]" % (uri,
+                        exc))
 
         klass = components.pop(-1)
+
         try:
-            mod = __import__('.'.join(components))
+            mod = import_module('.'.join(components))
         except:
             exc = traceback.format_exc()
-            raise RuntimeError("class uri %r invalid or not found: \n\n[%s]" % (uri,
-                exc))
-
-        for comp in components[1:]:
-            mod = getattr(mod, comp)
+            raise RuntimeError(
+                    "class uri %r invalid or not found: \n\n[%s]" %
+                    (uri, exc))
         return getattr(mod, klass)
 
 
@@ -321,11 +326,11 @@ def write_error(sock, status_int, reason, mesg):
         <title>%(reason)s</title>
       </head>
       <body>
-        <h1>%(reason)s</h1>
+        <h1><p>%(reason)s</p></h1>
         %(mesg)s
       </body>
     </html>
-    """) % {"reason": reason, "mesg": mesg}
+    """) % {"reason": reason, "mesg": cgi.escape(mesg)}
 
     http = textwrap.dedent("""\
     HTTP/1.1 %s %s\r
@@ -391,11 +396,7 @@ def http_date(timestamp=None):
     """Return the current date and time formatted for a message header."""
     if timestamp is None:
         timestamp = time.time()
-    year, month, day, hh, mm, ss, wd, y, z = time.gmtime(timestamp)
-    s = "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (
-            weekdayname[wd],
-            day, monthname[month], year,
-            hh, mm, ss)
+    s = email.utils.formatdate(timestamp, localtime=False, usegmt=True)
     return s
 
 
@@ -507,3 +508,29 @@ def to_bytestring(value):
         return value
     assert isinstance(value, text_type)
     return value.encode("utf-8")
+
+
+def is_fileobject(obj):
+    if not hasattr(obj, "tell") or not hasattr(obj, "fileno"):
+        return False
+
+    # check BytesIO case and maybe others
+    try:
+        obj.fileno()
+    except io.UnsupportedOperation:
+        return False
+
+    return True
+
+
+def warn(msg):
+    sys.stderr.write("!!!\n")
+
+    lines = msg.splitlines()
+    for i, line in enumerate(lines):
+        if i == 0:
+            line = "WARNING: %s" % line
+        sys.stderr.write("!!! %s\n" % line)
+
+    sys.stderr.write("!!!\n\n")
+    sys.stderr.flush()

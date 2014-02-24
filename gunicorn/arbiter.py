@@ -93,35 +93,39 @@ class Arbiter(object):
         if 'GUNICORN_FD' in os.environ:
             self.log.reopen_files()
 
+        self.worker_class = self.cfg.worker_class
         self.address = self.cfg.address
         self.num_workers = self.cfg.workers
-        self.debug = self.cfg.debug
         self.timeout = self.cfg.timeout
         self.proc_name = self.cfg.proc_name
-        self.worker_class = self.cfg.worker_class
 
-        if self.cfg.debug:
-            self.log.debug("Current configuration:")
-            for config, value in sorted(self.cfg.settings.items(),
-                    key=lambda setting: setting[1]):
-                self.log.debug("  %s: %s", config, value.value)
+        self.log.debug('Current configuration:\n{0}'.format(
+            '\n'.join(
+                '  {0}: {1}'.format(config, value.value)
+                for config, value
+                in sorted(self.cfg.settings.items(),
+                          key=lambda setting: setting[1]))))
 
         if self.cfg.preload_app:
-            if not self.cfg.debug:
-                self.app.wsgi()
-            else:
-                self.log.warning("debug mode: app isn't preloaded.")
+            self.app.wsgi()
 
     def start(self):
         """\
         Initialize the arbiter. Start listening and set pidfile if needed.
         """
         self.log.info("Starting gunicorn %s", __version__)
+
         self.pid = os.getpid()
         if self.cfg.pidfile is not None:
             self.pidfile = Pidfile(self.cfg.pidfile)
             self.pidfile.create(self.pid)
         self.cfg.on_starting(self)
+
+        # set enviroment' variables
+        if self.cfg.env:
+            for k, v in self.cfg.env.items():
+                os.environ[k] = v
+
         self.init_signals()
         if not self.LISTENERS:
             self.LISTENERS = create_sockets(self.cfg, self.log)
@@ -274,7 +278,7 @@ class Arbiter(object):
             self.num_workers = 0
             self.kill_workers(signal.SIGQUIT)
         else:
-            self.log.info("SIGWINCH ignored. Not daemonized")
+            self.log.debug("SIGWINCH ignored. Not daemonized")
 
     def wakeup(self):
         """\
@@ -301,8 +305,15 @@ class Arbiter(object):
         Sleep until PIPE is readable or we timeout.
         A readable PIPE means a signal occurred.
         """
+        if self.WORKERS:
+            oldest = min(w.tmp.last_update() for w in self.WORKERS.values())
+            timeout = self.timeout - (time.time() - oldest)
+            # The timeout can be reached, so don't wait for a negative value
+            timeout = max(timeout, 1.0)
+        else:
+            timeout = 1.0
         try:
-            ready = select.select([self.PIPE[0]], [], [], 1.0)
+            ready = select.select([self.PIPE[0]], [], [], timeout)
             if not ready[0]:
                 return
             while os.read(self.PIPE[0], 1):
@@ -346,16 +357,31 @@ class Arbiter(object):
             self.master_name = "Old Master"
             return
 
+        environ = self.cfg.env_orig.copy()
         fds = [l.fileno() for l in self.LISTENERS]
-        os.environ['GUNICORN_FD'] = ",".join([str(fd) for fd in fds])
+        environ['GUNICORN_FD'] = ",".join([str(fd) for fd in fds])
 
         os.chdir(self.START_CTX['cwd'])
         self.cfg.pre_exec(self)
 
-        os.execvpe(self.START_CTX[0], self.START_CTX['args'], os.environ)
+        # exec the process using the original environnement
+        os.execvpe(self.START_CTX[0], self.START_CTX['args'], environ)
 
     def reload(self):
         old_address = self.cfg.address
+
+        # reset old environement
+        for k in self.cfg.env:
+            if k in self.cfg.env_orig:
+                # reset the key to the value it had before
+                # we launched gunicorn
+                os.environ[k] = self.cfg.env_orig[k]
+            else:
+                # delete the value set by gunicorn
+                try:
+                    del os.environ[k]
+                except KeyError:
+                    pass
 
         # reload conf
         self.app.reload()
@@ -367,7 +393,7 @@ class Arbiter(object):
         # do we need to change listener ?
         if old_address != self.cfg.address:
             # close all listeners
-            [l.close for l in self.LISTENERS]
+            [l.close() for l in self.LISTENERS]
             # init new listeners
             self.LISTENERS = create_sockets(self.cfg, self.log)
             self.log.info("Listening at: %s", ",".join(str(self.LISTENERS)))
