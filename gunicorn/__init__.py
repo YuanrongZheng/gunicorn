@@ -4,5 +4,5 @@
 # See the NOTICE for more information.
 
 version_info = (18, 2)
-__version__ = ".".join([str(v) for v in version_info]) + 'moriyoshi1'
+__version__ = ".".join([str(v) for v in version_info]) + '-moriyoshi1'
 SERVER_SOFTWARE = "gunicorn/%s" % __version__
